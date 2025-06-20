@@ -40,22 +40,22 @@ def do_search(client, collection_name, query_vector):
     Execute a single search operation
     """
     try:
-        # client.search(
-        #     collection_name=collection_name,
-        #     filter="position in ['北京市'] and age>18 and registration_days < 1000",
-        #     data=[query_vector],
-        #     limit=10,
-        #     output_fields=["auto_id"]
-        #     # search_params={"params": {"index_algo": "quantbf"}}
-        # )
-        client.query(
+        client.search(
             collection_name=collection_name,
             filter="position in ['北京市'] and age>18 and registration_days < 1000",
-            # data=[query_vector],
+            data=[query_vector],
             limit=10,
-            output_fields=["*"]
+            output_fields=["auto_id"]
             # search_params={"params": {"index_algo": "quantbf"}}
         )
+        # client.query(
+        #     collection_name=collection_name,
+        #     filter="position in ['北京市'] and age>18 and registration_days < 1000",
+        #     # data=[query_vector],
+        #     limit=10,
+        #     output_fields=["*"]
+        #     # search_params={"params": {"index_algo": "quantbf"}}
+        # )
         return True
     except Exception as e:
         print(f"Search error")
@@ -161,6 +161,57 @@ def test_search_qps(concurrency=300, test_duration=600):
     print(f"  Maximum response time: {max(thread_stats['max_response_time'] for thread_stats in all_thread_stats):.3f} seconds")
     print(f"  Minimum response time: {min(thread_stats['min_response_time'] for thread_stats in all_thread_stats):.3f} seconds")
 
-# Run QPS test
-test_search_qps()
 
+
+def test_insert_qps(concurrency=20, test_duration=600):
+    """
+    Execute insert QPS test using multi-threaded concurrent insert
+    """
+    import threading
+    from queue import Queue
+
+    print(fmt.format("Starting concurrent QPS test"))
+    import random
+    
+    def insert(client):
+        start_time = time.time()
+        while time.time() - start_time < test_duration:
+            query_vector = embeddings[random.randint(0, len(embeddings)-1)]
+            rows = [
+                {
+                    "embedding": query_vector,
+                    "position": "北京市",
+                    "age": 25,
+                    "registration_days": 999
+                }
+            ]
+            client.insert(collection_name, rows)
+    threads = []
+    for _ in range(concurrency):
+        t = threading.Thread(target=insert, args=(milvus_client,))
+        threads.append(t)
+        t.start()
+    
+    for t in threads:
+        t.join()
+    
+    
+
+# Run QPS test
+if __name__ == "__main__":
+    import threading
+
+    # Create threads for each test function
+    # You can adjust concurrency and duration for each test
+    insert_thread = threading.Thread(target=test_insert_qps, kwargs={"concurrency": 20, "test_duration": 60})
+    search_thread = threading.Thread(target=test_search_qps, kwargs={"concurrency": 50, "test_duration": 60})
+
+    # Start the threads
+    insert_thread.start()
+    search_thread.start()
+
+    # Wait for both threads to complete
+    insert_thread.join()
+    search_thread.join()
+
+    print("\nBoth insert and search QPS tests are complete.")
