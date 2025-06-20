@@ -62,7 +62,7 @@ def do_search(client, collection_name, query_vector):
         return False
 
 # Execute QPS test
-def test_search_qps(concurrency=300, test_duration=600):
+def test_search_qps(concurrency=60, test_duration=180):
     """
     Execute search QPS test using multi-threaded concurrent search
     Parameters:
@@ -163,20 +163,23 @@ def test_search_qps(concurrency=300, test_duration=600):
 
 
 
-def test_insert_qps(concurrency=20, test_duration=600):
+def test_insert_qps(concurrency=20, test_duration=180):
     """
     Execute insert QPS test using multi-threaded concurrent insert
     """
     import threading
-    from queue import Queue
-
-    print(fmt.format("Starting concurrent QPS test"))
     import random
-    
-    def insert(client):
-        start_time = time.time()
-        while time.time() - start_time < test_duration:
-            query_vector = embeddings[random.randint(0, len(embeddings)-1)]
+
+    print(fmt.format("Starting concurrent Insert QPS test"))
+
+    successful_inserts = 0
+    total_inserts = 0
+    lock = threading.Lock()
+    all_thread_stats = []
+
+    def do_insert():
+        try:
+            query_vector = embeddings[random.randint(0, len(embeddings) - 1)]
             rows = [
                 {
                     "embedding": query_vector,
@@ -185,17 +188,82 @@ def test_insert_qps(concurrency=20, test_duration=600):
                     "registration_days": 999
                 }
             ]
-            client.insert(collection_name, rows)
+            milvus_client.insert(collection_name, rows)
+            time.sleep(1)
+            return True
+        except Exception as e:
+            print(f"Insert error: {e}")
+            return False
+
+    def worker():
+        nonlocal successful_inserts, total_inserts
+        thread_start = time.time()
+
+        thread_stats = {
+            'successful_queries': 0,
+            'total_queries': 0,
+            'total_response_time': 0,
+            'max_response_time': 0,
+            'min_response_time': float('inf')
+        }
+
+        while time.time() - thread_start < test_duration:
+            insert_start = time.time()
+            success = do_insert()
+            insert_end = time.time()
+            response_time = insert_end - insert_start
+
+            if success:
+                thread_stats['successful_queries'] += 1
+            thread_stats['total_queries'] += 1
+            thread_stats['total_response_time'] += response_time
+            thread_stats['max_response_time'] = max(thread_stats['max_response_time'], response_time)
+            thread_stats['min_response_time'] = min(thread_stats['min_response_time'], response_time)
+
+        with lock:
+            all_thread_stats.append(thread_stats)
+            successful_inserts += thread_stats['successful_queries']
+            total_inserts += thread_stats['total_queries']
+
     threads = []
+    start_time = time.time()
+
     for _ in range(concurrency):
-        t = threading.Thread(target=insert, args=(milvus_client,))
+        t = threading.Thread(target=worker)
         threads.append(t)
         t.start()
-    
+
     for t in threads:
         t.join()
+
+    end_time = time.time()
+    actual_duration = end_time - start_time
     
-    
+    if actual_duration > 0:
+        actual_qps = total_inserts / actual_duration
+    else:
+        actual_qps = 0
+
+    success_rate = (successful_inserts / total_inserts) * 100 if total_inserts > 0 else 0
+
+    if total_inserts > 0:
+        avg_response_time = sum(thread_stats['total_response_time'] for thread_stats in all_thread_stats) / total_inserts
+    else:
+        avg_response_time = 0
+
+    print(f"\nInsert Test completed:")
+    print(f"Total inserts: {total_inserts}")
+    print(f"Successful inserts: {successful_inserts}")
+    print(f"Actual insert QPS: {actual_qps:.2f}")
+    print(f"Success rate: {success_rate:.2f}%")
+    print(f"Actual duration: {actual_duration:.2f} seconds")
+    print(f"Response time statistics:")
+    print(f"  Average response time: {avg_response_time:.3f} seconds")
+
+    if all_thread_stats and total_inserts > 0:
+        print(f"  Maximum response time: {max(thread_stats['max_response_time'] for thread_stats in all_thread_stats):.3f} seconds")
+        min_response_time = min(thread_stats['min_response_time'] for thread_stats in all_thread_stats if thread_stats['min_response_time'] != float('inf'))
+        print(f"  Minimum response time: {min_response_time:.3f} seconds")
 
 # Run QPS test
 if __name__ == "__main__":
@@ -203,8 +271,8 @@ if __name__ == "__main__":
 
     # Create threads for each test function
     # You can adjust concurrency and duration for each test
-    insert_thread = threading.Thread(target=test_insert_qps, kwargs={"concurrency": 20, "test_duration": 60})
-    search_thread = threading.Thread(target=test_search_qps, kwargs={"concurrency": 50, "test_duration": 60})
+    insert_thread = threading.Thread(target=test_insert_qps)
+    search_thread = threading.Thread(target=test_search_qps)
 
     # Start the threads
     insert_thread.start()
