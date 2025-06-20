@@ -50,7 +50,8 @@ print(f"Does collection hello_milvus exist in Milvus: {has}")
 fields = [
     FieldSchema(name="pk", dtype=DataType.VARCHAR, is_primary=True, auto_id=False, max_length=100),
     FieldSchema(name="random", dtype=DataType.DOUBLE),
-    FieldSchema(name="embeddings", dtype=DataType.FLOAT_VECTOR, dim=dim)
+    FieldSchema(name="embeddings", dtype=DataType.FLOAT_VECTOR, dim=dim),
+    FieldSchema(name="age", dtype=DataType.INT64, nullable=True),
 ]
 
 schema = CollectionSchema(fields, "hello_milvus is the simplest demo to introduce the APIs")
@@ -74,6 +75,7 @@ entities = [
     [str(i) for i in range(num_entities)],
     rng.random(num_entities).tolist(),  # field random, only supports list
     rng.random((num_entities, dim), np.float32),    # field embeddings, supports numpy.ndarray and list
+    
 ]
 
 insert_result = hello_milvus.insert(entities)
