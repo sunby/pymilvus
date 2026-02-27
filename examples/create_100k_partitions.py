@@ -19,13 +19,9 @@ def create_collection_if_not_exists(client: MilvusClient, collection_name: str, 
         schema.add_field(field_name="id", datatype=DataType.INT64, is_primary=True)
         schema.add_field(field_name="vector", datatype=DataType.FLOAT_VECTOR, dim=dim)
 
-        index_params = client.prepare_index_params()
-        index_params.add_index(field_name="vector", index_type="IVF_FLAT", metric_type="L2", params={"nlist": 128})
-
         client.create_collection(
             collection_name=collection_name,
             schema=schema,
-            index_params=index_params
         )
         print(f"Collection '{collection_name}' created successfully")
 
