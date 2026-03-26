@@ -3,11 +3,38 @@
 """
 
 import time
+import os
 import argparse
+import logging
+import multiprocessing as mp
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from pymilvus import MilvusClient, DataType
+
+
+_WORKER_CLIENT = None
+_WORKER_RNG = None
+WORKER_LOG_INTERVAL = 100
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+
+
+def init_worker(uri: str):
+    """为每个进程初始化独立的Milvus连接和随机数生成器"""
+    global _WORKER_CLIENT, _WORKER_RNG
+    _WORKER_CLIENT = MilvusClient(uri=uri)
+    _WORKER_RNG = np.random.default_rng(seed=time.time_ns() ^ os.getpid())
+
+
+def get_worker_client() -> MilvusClient:
+    """获取当前worker进程中的Milvus连接"""
+    if _WORKER_CLIENT is None:
+        raise RuntimeError("Worker client is not initialized")
+    return _WORKER_CLIENT
 
 
 def create_collection_if_not_exists(client: MilvusClient, collection_name: str, dim: int = 128):
@@ -19,19 +46,15 @@ def create_collection_if_not_exists(client: MilvusClient, collection_name: str, 
         schema.add_field(field_name="id", datatype=DataType.INT64, is_primary=True)
         schema.add_field(field_name="vector", datatype=DataType.FLOAT_VECTOR, dim=dim)
 
-        index_params = client.prepare_index_params()
-        index_params.add_index(field_name="vector", index_type="IVF_FLAT", metric_type="L2", params={"nlist": 128})
-
         client.create_collection(
             collection_name=collection_name,
             schema=schema,
-            index_params=index_params
         )
         print(f"Collection '{collection_name}' created successfully")
 
 
 class TimingStats:
-    """线程安全的耗时统计"""
+    """主进程中的耗时统计"""
     def __init__(self):
         self.lock = Lock()
         self.insert_times = []
@@ -64,7 +87,7 @@ class TimingStats:
 
 
 class ProgressTracker:
-    """线程安全的进度追踪器"""
+    """主进程中的进度追踪器"""
     def __init__(self, total: int, report_interval: int = 1000, window_size: int = 1000, records_per_partition: int = 0):
         self.total = total
         self.completed = 0
@@ -93,7 +116,8 @@ class ProgressTracker:
                 self.timestamps.pop(0)
 
             processed = self.completed + self.failed
-            if processed == self.total:
+            should_report = (processed % self.report_interval == 0) or (processed == self.total)
+            if should_report:
                 elapsed = time.time() - self.start_time
                 avg_rate = processed / elapsed if elapsed > 0 else 0
 
@@ -121,36 +145,39 @@ class ProgressTracker:
                 print(msg)
 
 
-def create_partition_task(client: MilvusClient, collection_name: str,
-                          partition_name: str, tracker: ProgressTracker) -> tuple:
-    """创建单个partition的任务"""
-    try:
-        client.create_partition(collection_name, partition_name)
-        tracker.update(success=True)
-        return (partition_name, True, None)
-    except Exception as e:
-        tracker.update(success=False)
-        return (partition_name, False, str(e))
+def create_partition_chunk_task(collection_name: str, partition_names: list) -> tuple:
+    """在一个worker进程中顺序创建一批partition"""
+    client = get_worker_client()
+    success_count = 0
+    failed_partitions = []
+    total = len(partition_names)
+
+    for idx, partition_name in enumerate(partition_names, start=1):
+        try:
+            client.create_partition(collection_name, partition_name)
+            success_count += 1
+        except Exception as e:
+            logging.warning(
+                "Failed to create partition '%s' in collection '%s': %s",
+                partition_name,
+                collection_name,
+                e,
+            )
+            failed_partitions.append((partition_name, str(e)))
+        if idx % WORKER_LOG_INTERVAL == 0 or idx == total:
+            logging.info(
+                "Worker pid=%s create progress: %s/%s partitions in collection '%s'",
+                os.getpid(),
+                idx,
+                total,
+                collection_name,
+            )
+    return success_count, failed_partitions
 
 
-def insert_data_task(client: MilvusClient, collection_name: str,
-                     partition_name: str, num_records: int, dim: int,
-                     flush_interval: int, tracker: ProgressTracker) -> tuple:
-    """向单个partition写入数据的任务"""
-    try:
-        for i in range(0, num_records, flush_interval):
-            batch_size = min(flush_interval, num_records - i)
-            data = [
-                {"id": j, "vector": np.random.random(dim).tolist()}
-                for j in range(i, i + batch_size)
-            ]
-            client.insert(collection_name, data, partition_name=partition_name)
-            client.flush(collection_name)
-        tracker.update(success=True)
-        return (partition_name, True, None)
-    except Exception as e:
-        tracker.update(success=False)
-        return (partition_name, False, str(e))
+def create_partition_worker_task(args) -> list:
+    """multiprocessing.Pool 的包装任务"""
+    return create_partition_chunk_task(*args)
 
 
 def chunk_list(lst: list, num_chunks: int) -> list:
@@ -161,27 +188,50 @@ def chunk_list(lst: list, num_chunks: int) -> list:
     return [lst[i:i + chunk_size] for i in range(0, len(lst), chunk_size)]
 
 
-def insert_chunk_task_one_round(client: MilvusClient, collection_name: str,
-                                partition_names: list, round_idx: int,
-                                records_per_round: int, dim: int,
-                                tracker: ProgressTracker) -> list:
-    """一轮insert：向一批partition各写入records_per_round条数据"""
+def insert_chunk_task_one_round(collection_name: str, partition_names: list,
+                                round_idx: int, records_per_round: int,
+                                dim: int) -> tuple:
+    """一轮insert：在一个worker进程中向一批partition写入数据"""
+    client = get_worker_client()
     results = []
+    insert_times = []
     id_offset = round_idx * records_per_round
-    for partition_name in partition_names:
+    total = len(partition_names)
+    for idx, partition_name in enumerate(partition_names, start=1):
         try:
+            vectors = _WORKER_RNG.random((records_per_round, dim)).tolist()
             data = [
-                {"id": id_offset + j, "vector": np.random.random(dim).tolist()}
-                for j in range(records_per_round)
+                {"id": id_offset + j, "vector": vector}
+                for j, vector in enumerate(vectors)
             ]
             t0 = time.time()
             client.insert(collection_name, data, partition_name=partition_name)
-            t1 = time.time()
-            tracker.timing.add_insert(t1 - t0)
+            insert_times.append(time.time() - t0)
             results.append((partition_name, True, None))
         except Exception as e:
+            logging.warning(
+                "Failed to insert into partition '%s' in collection '%s' (round=%s): %s",
+                partition_name,
+                collection_name,
+                round_idx + 1,
+                e,
+            )
             results.append((partition_name, False, str(e)))
-    return results
+        if idx % WORKER_LOG_INTERVAL == 0 or idx == total:
+            logging.info(
+                "Worker pid=%s insert progress: round=%s %s/%s partitions in collection '%s'",
+                os.getpid(),
+                round_idx + 1,
+                idx,
+                total,
+                collection_name,
+            )
+    return results, insert_times
+
+
+def insert_chunk_worker_task(args) -> tuple:
+    """multiprocessing.Pool 的包装任务"""
+    return insert_chunk_task_one_round(*args)
 
 
 def insert_data_concurrent(
@@ -191,7 +241,7 @@ def insert_data_concurrent(
     num_rounds: int = 10,
     records_per_round: int = 10,
     dim: int = 128,
-    max_workers: int = 50,
+    max_workers: int = 16,
     report_interval: int = 100
 ):
     """
@@ -204,7 +254,7 @@ def insert_data_concurrent(
         num_rounds: 总轮数
         records_per_round: 每轮每个partition写入的记录数
         dim: 向量维度
-        max_workers: 最大并发线程数
+        max_workers: 最大并发worker数
         report_interval: 每完成多少个partition打印一次进度
     """
     total_records = num_rounds * records_per_round
@@ -221,24 +271,21 @@ def insert_data_concurrent(
     start_time = time.time()
     flush_client = MilvusClient(uri=uri)
 
-    # 每个worker维护一个持久连接
-    worker_clients = [MilvusClient(uri=uri) for _ in range(len(chunks))]
-
-    for round_idx in range(num_rounds):
-        round_start = time.time()
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            def worker_task(args):
-                chunk_idx, chunk = args
-                return insert_chunk_task_one_round(
-                    worker_clients[chunk_idx], collection_name, chunk,
-                    round_idx, records_per_round, dim, tracker
-                )
-
-            futures = [executor.submit(worker_task, (i, chunk)) for i, chunk in enumerate(chunks)]
-
-            for future in as_completed(futures):
-                results = future.result()
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(
+        processes=min(max_workers, len(chunks)),
+        initializer=init_worker,
+        initargs=(uri,),
+    ) as pool:
+        for round_idx in range(num_rounds):
+            round_start = time.time()
+            worker_args = [
+                (collection_name, chunk, round_idx, records_per_round, dim)
+                for chunk in chunks
+            ]
+            for results, insert_times in pool.imap_unordered(insert_chunk_worker_task, worker_args):
+                for elapsed_insert in insert_times:
+                    tracker.timing.add_insert(elapsed_insert)
                 for partition_name, success, error in results:
                     if success:
                         tracker.update(success=True)
@@ -246,13 +293,14 @@ def insert_data_concurrent(
                         tracker.update(success=False)
                         failed_partitions.append((partition_name, error))
 
-        # 每轮结束后flush
-        print(f"Round {round_idx + 1}/{num_rounds} writes completed, starting flush...")
-        t0 = time.time()
-        flush_client.flush(collection_name)
-        flush_time = time.time() - t0
-        round_time = time.time() - round_start
-        print(f"Round {round_idx + 1}/{num_rounds} done | Round time: {round_time:.2f}s | Flush time: {flush_time:.2f}s")
+            # 每轮结束后flush
+            print(f"Round {round_idx + 1}/{num_rounds} writes completed, starting flush...")
+            t0 = time.time()
+            flush_client.flush(collection_name)
+            flush_time = time.time() - t0
+            tracker.timing.add_flush(flush_time)
+            round_time = time.time() - round_start
+            print(f"Round {round_idx + 1}/{num_rounds} done | Round time: {round_time:.2f}s | Flush time: {flush_time:.2f}s")
 
     elapsed = time.time() - start_time
 
@@ -276,6 +324,8 @@ def insert_data_concurrent(
     print(f"\n--- Timing Stats ---")
     ins = stats["insert"]
     print(f"Insert: count={ins['count']}, avg={ins['avg']*1000:.2f}ms, min={ins['min']*1000:.2f}ms, max={ins['max']*1000:.2f}ms, total={ins['total']:.2f}s")
+    flush = stats["flush"]
+    print(f"Flush: count={flush['count']}, avg={flush['avg']*1000:.2f}ms, min={flush['min']*1000:.2f}ms, max={flush['max']*1000:.2f}ms, total={flush['total']:.2f}s")
 
     if failed_partitions:
         print(f"\nFailed partitions (showing first 10):")
@@ -289,7 +339,7 @@ def create_partitions_concurrent(
     uri: str,
     collection_name: str,
     num_partitions: int = 100000,
-    max_workers: int = 50,
+    max_workers: int = 16,
     partition_prefix: str = "partition_",
     num_rounds: int = 10,
     records_per_round: int = 10,
@@ -303,7 +353,7 @@ def create_partitions_concurrent(
         uri: Milvus服务地址
         collection_name: collection名称
         num_partitions: 要创建的partition数量
-        max_workers: 最大并发线程数
+        max_workers: 最大并发worker数
         partition_prefix: partition名称前缀
         num_rounds: 总轮数
         records_per_round: 每轮每个partition写入的记录数
@@ -351,25 +401,28 @@ def create_partitions_concurrent(
 
     print(f"Creating {len(partitions_to_create)} partitions with {max_workers} workers...")
 
-    tracker = ProgressTracker(len(partitions_to_create), report_interval=1000)
     failed_partitions = []
+    created_count = 0
 
     start_time = time.time()
+    chunks = chunk_list(partitions_to_create, max_workers)
+    print(f"Split creation work into {len(chunks)} worker chunks, ~{len(chunks[0]) if chunks else 0} partitions per worker")
 
-    # 使用线程池并发创建partition
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # 每个线程创建自己的client连接
-        def worker_task(partition_name):
-            # 每个任务使用独立的client连接
-            worker_client = MilvusClient(uri=uri)
-            return create_partition_task(worker_client, collection_name, partition_name, tracker)
+    # 使用进程池并发创建partition，避免Python层线程竞争GIL
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(
+        processes=min(max_workers, len(chunks)),
+        initializer=init_worker,
+        initargs=(uri,),
+    ) as pool:
+        worker_args = [
+            (collection_name, chunk)
+            for chunk in chunks
+        ]
 
-        futures = {executor.submit(worker_task, name): name for name in partitions_to_create}
-
-        for future in as_completed(futures):
-            partition_name, success, error = future.result()
-            if not success:
-                failed_partitions.append((partition_name, error))
+        for success_count, failed_chunk in pool.imap_unordered(create_partition_worker_task, worker_args):
+            created_count += success_count
+            failed_partitions.extend(failed_chunk)
 
     elapsed = time.time() - start_time
 
@@ -378,10 +431,10 @@ def create_partitions_concurrent(
     print("SUMMARY")
     print("=" * 60)
     print(f"Total partitions requested: {num_partitions}")
-    print(f"Partitions created: {tracker.completed}")
-    print(f"Partitions failed: {tracker.failed}")
+    print(f"Partitions created: {created_count}")
+    print(f"Partitions failed: {len(failed_partitions)}")
     print(f"Total time: {elapsed:.2f} seconds")
-    print(f"Average rate: {tracker.completed / elapsed:.2f} partitions/second")
+    print(f"Average rate: {created_count / elapsed:.2f} partitions/second")
 
     if failed_partitions:
         print(f"\nFailed partitions (showing first 10):")
@@ -409,14 +462,14 @@ def create_partitions_concurrent(
 
 def main():
     parser = argparse.ArgumentParser(description="并发创建100k partition并写入数据")
-    parser.add_argument("--uri", type=str, default="http://localhost:19530",
-                        help="Milvus服务地址 (default: http://localhost:19530)")
+    parser.add_argument("--uri", type=str, default="http://10.15.1.205:19530",
+                        help="Milvus服务地址 (default: http://10.15.1.205:19530)")
     parser.add_argument("--collection", type=str, default="test_100k_partitions",
                         help="Collection名称 (default: test_100k_partitions)")
     parser.add_argument("--num-partitions", type=int, default=100000,
                         help="要创建的partition数量 (default: 100000)")
-    parser.add_argument("--workers", type=int, default=50,
-                        help="并发线程数 (default: 50)")
+    parser.add_argument("--workers", type=int, default=16,
+                        help="并发worker数 (default: 16)")
     parser.add_argument("--prefix", type=str, default="partition_",
                         help="Partition名称前缀 (default: partition_)")
     parser.add_argument("--num-rounds", type=int, default=10,
@@ -425,8 +478,8 @@ def main():
                         help="每轮每个partition写入的记录数 (default: 10)")
     parser.add_argument("--dim", type=int, default=128,
                         help="向量维度 (default: 128)")
-    parser.add_argument("--report-interval", type=int, default=100,
-                        help="每完成多少个partition打印一次进度 (default: 100)")
+    parser.add_argument("--report-interval", type=int, default=500,
+                        help="每完成多少个partition打印一次进度 (default: 500)")
 
     args = parser.parse_args()
 
